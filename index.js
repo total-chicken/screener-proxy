@@ -1,6 +1,14 @@
 const express  = require('express');
 const fetch    = require('node-fetch');
 const app      = express();
+// ── CORS — allow all origins ──
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'x-api-key, Content-Type');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  next();
+});
 
 const PORT        = process.env.PORT        || 3000;
 const SESSION_ID  = process.env.SESSION_ID  || '';
