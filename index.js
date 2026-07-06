@@ -1,5 +1,6 @@
 const express  = require('express');
 const fetch    = require('node-fetch');
+const session  = require('./screenerSession');
 const app      = express();
 // ── CORS — allow all origins ──
 app.use((req, res, next) => {
@@ -10,13 +11,56 @@ app.use((req, res, next) => {
   next();
 });
 
-const PORT        = process.env.PORT        || 3000;
-const SESSION_ID  = process.env.SESSION_ID  || '';
-const CSRF_TOKEN  = process.env.CSRF_TOKEN  || '';
-const API_KEY     = process.env.API_KEY     || '';
+const PORT    = process.env.PORT    || 3000;
+const API_KEY = process.env.API_KEY || '';
 
-const COOKIE = `sessionid=${SESSION_ID}; csrftoken=${CSRF_TOKEN}`;
 const SCREENER_BASE = 'https://www.screener.in';
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+
+// ── Session-aware fetch ──
+// Sends the current session cookie; on an auth failure (403/401,
+// redirect to /login/, or a login-wall page) re-logins once and retries.
+// authFailed:true in the result means even the fresh login didn't help
+// (i.e. credentials are wrong) — callers surface that as a 401.
+async function fetchWithSession(url, extraHeaders = {}) {
+  const attempt = async () => {
+    const resp = await fetch(url, {
+      redirect: 'manual',
+      headers: {
+        'Cookie'    : session.cookieHeader(),
+        'User-Agent': UA,
+        ...extraHeaders
+      }
+    });
+    const status   = resp.status;
+    const location = resp.headers.get('location') || '';
+    const html     = status >= 200 && status < 300 ? await resp.text() : '';
+    // Session-gated endpoints bounce anonymous/invalid sessions to
+    // /login/ or /register/ (both carry a ?next= back-reference)
+    const authFailed =
+      status === 401 || status === 403 ||
+      (status >= 300 && status < 400 && /\/(login|register)\//.test(location)) ||
+      (html && html.includes('id="login-form"'));
+    return { status, location, html, authFailed };
+  };
+
+  await session.ensure();
+  let r = await attempt();
+  if (r.authFailed) {
+    await session.refresh(); // throws with a clear message on bad credentials
+    r = await attempt();
+  }
+  return r;
+}
+
+const XHR_HEADERS = {
+  'X-Requested-With': 'XMLHttpRequest',
+  'Referer'         : `${SCREENER_BASE}/company/`
+};
+
+const AUTH_ERROR = {
+  error: 'screener.in auth failed even after auto-login — check SCREENER_EMAIL / SCREENER_PASSWORD env vars'
+};
 
 // ── Auth middleware ──
 function checkKey(req, res, next) {
@@ -32,6 +76,26 @@ app.get('/', (req, res) => {
   res.json({ status: 'ok', service: 'screener-proxy' });
 });
 
+// ── Shared: resolve a symbol to its warehouse ID ──
+// A plain 3xx here (not to /login/) is screener redirecting between
+// consolidated/standalone views — just try the next URL.
+async function findWarehouse(symbol) {
+  const urls = [
+    `${SCREENER_BASE}/company/${symbol}/consolidated/`,
+    `${SCREENER_BASE}/company/${symbol}/`
+  ];
+
+  for (const url of urls) {
+    const r = await fetchWithSession(url);
+    if (r.authFailed) return { authFailed: true };
+    if (r.status !== 200) continue;
+
+    const match = r.html.match(/data-warehouse-id="(\d+)"/);
+    if (match) return { warehouseId: match[1], url };
+  }
+  return {};
+}
+
 // ── Get warehouse ID from stock symbol ──
 // GET /warehouse?symbol=INFY
 app.get('/warehouse', checkKey, async (req, res) => {
@@ -41,42 +105,17 @@ app.get('/warehouse', checkKey, async (req, res) => {
   }
 
   try {
-    const urls = [
-      `${SCREENER_BASE}/company/${symbol}/consolidated/`,
-      `${SCREENER_BASE}/company/${symbol}/`
-    ];
-
-    for (const url of urls) {
-      const resp = await fetch(url, {
-        headers: {
-          'Cookie'    : COOKIE,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
-        }
-      });
-
-      if (resp.status !== 200) continue;
-
-      const html = await resp.text();
-
-      // Check not login wall
-      if (html.includes('id="login-form"')) {
-        return res.status(401).json({
-          error  : 'Cookie expired — update SESSION_ID and CSRF_TOKEN'
-        });
-      }
-
-      // Extract warehouse ID
-      const match = html.match(/data-warehouse-id="(\d+)"/);
-      if (match) {
-        return res.json({
-          symbol      : symbol,
-          warehouse_id: match[1],
-          url         : url
-        });
-      }
+    const found = await findWarehouse(symbol);
+    if (found.authFailed) return res.status(401).json(AUTH_ERROR);
+    if (!found.warehouseId) {
+      return res.status(404).json({ error: 'Warehouse ID not found for: ' + symbol });
     }
 
-    res.status(404).json({ error: 'Warehouse ID not found for: ' + symbol });
+    res.json({
+      symbol      : symbol,
+      warehouse_id: found.warehouseId,
+      url         : found.url
+    });
 
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -90,25 +129,12 @@ app.get('/quick_ratios', checkKey, async (req, res) => {
   if (!wid) return res.status(400).json({ error: 'warehouse_id required' });
 
   try {
-    const url  = `${SCREENER_BASE}/api/company/${wid}/quick_ratios/`;
-    const resp = await fetch(url, {
-      headers: {
-        'Cookie'           : COOKIE,
-        'X-Requested-With' : 'XMLHttpRequest',
-        'Referer'          : `${SCREENER_BASE}/company/`,
-        'User-Agent'       : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
-      }
-    });
+    const r = await fetchWithSession(
+      `${SCREENER_BASE}/api/company/${wid}/quick_ratios/`, XHR_HEADERS
+    );
+    if (r.authFailed) return res.status(401).json(AUTH_ERROR);
 
-    if (resp.status === 403 || resp.status === 401) {
-      return res.status(401).json({
-        error: 'Cookie expired — update SESSION_ID and CSRF_TOKEN'
-      });
-    }
-
-    const html   = await resp.text();
-    const ratios = parseQuickRatios(html);
-
+    const ratios = parseQuickRatios(r.html);
     res.json({ warehouse_id: wid, ratios });
 
   } catch (e) {
@@ -123,25 +149,12 @@ app.get('/peers', checkKey, async (req, res) => {
   if (!wid) return res.status(400).json({ error: 'warehouse_id required' });
 
   try {
-    const url  = `${SCREENER_BASE}/api/company/${wid}/peers/`;
-    const resp = await fetch(url, {
-      headers: {
-        'Cookie'           : COOKIE,
-        'X-Requested-With' : 'XMLHttpRequest',
-        'Referer'          : `${SCREENER_BASE}/company/`,
-        'User-Agent'       : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
-      }
-    });
+    const r = await fetchWithSession(
+      `${SCREENER_BASE}/api/company/${wid}/peers/`, XHR_HEADERS
+    );
+    if (r.authFailed) return res.status(401).json(AUTH_ERROR);
 
-    if (resp.status === 403 || resp.status === 401) {
-      return res.status(401).json({
-        error: 'Cookie expired — update SESSION_ID and CSRF_TOKEN'
-      });
-    }
-
-    const html  = await resp.text();
-    const peers = parsePeersHTML(html);
-
+    const peers = parsePeersHTML(r.html);
     res.json({ warehouse_id: wid, peers });
 
   } catch (e) {
@@ -157,75 +170,33 @@ app.get('/stock', checkKey, async (req, res) => {
 
   try {
     // Step 1: Get warehouse ID
-    const urls = [
-      `${SCREENER_BASE}/company/${symbol}/consolidated/`,
-      `${SCREENER_BASE}/company/${symbol}/`
-    ];
-
-    let warehouseId = null;
-    let stockUrl    = null;
-
-    for (const url of urls) {
-      const resp = await fetch(url, {
-        headers: {
-          'Cookie'    : COOKIE,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
-        }
-      });
-
-      if (resp.status !== 200) continue;
-      const html  = await resp.text();
-
-      if (html.includes('id="login-form"')) {
-        return res.status(401).json({
-          error: 'Cookie expired — update SESSION_ID and CSRF_TOKEN'
-        });
-      }
-
-      const match = html.match(/data-warehouse-id="(\d+)"/);
-      if (match) {
-        warehouseId = match[1];
-        stockUrl    = url;
-        break;
-      }
-    }
-
-    if (!warehouseId) {
+    const found = await findWarehouse(symbol);
+    if (found.authFailed) return res.status(401).json(AUTH_ERROR);
+    if (!found.warehouseId) {
       return res.status(404).json({
         error: 'Stock not found on screener.in: ' + symbol
       });
     }
 
     // Step 2: Fetch ratios and peers in parallel
-    const [ratiosResp, peersResp] = await Promise.all([
-      fetch(`${SCREENER_BASE}/api/company/${warehouseId}/quick_ratios/`, {
-        headers: {
-          'Cookie'           : COOKIE,
-          'X-Requested-With' : 'XMLHttpRequest',
-          'Referer'          : stockUrl,
-          'User-Agent'       : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
-        }
-      }),
-      fetch(`${SCREENER_BASE}/api/company/${warehouseId}/peers/`, {
-        headers: {
-          'Cookie'           : COOKIE,
-          'X-Requested-With' : 'XMLHttpRequest',
-          'Referer'          : stockUrl,
-          'User-Agent'       : 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0'
-        }
-      })
+    const [ratiosR, peersR] = await Promise.all([
+      fetchWithSession(
+        `${SCREENER_BASE}/api/company/${found.warehouseId}/quick_ratios/`,
+        { 'X-Requested-With': 'XMLHttpRequest', 'Referer': found.url }
+      ),
+      fetchWithSession(
+        `${SCREENER_BASE}/api/company/${found.warehouseId}/peers/`,
+        { 'X-Requested-With': 'XMLHttpRequest', 'Referer': found.url }
+      )
     ]);
 
-    const ratiosHTML = await ratiosResp.text();
-    const peersHTML  = await peersResp.text();
-
-    const ratios = parseQuickRatios(ratiosHTML);
-    const peers  = parsePeersHTML(peersHTML);
+    const ratios = parseQuickRatios(ratiosR.html);
+    const peers  = parsePeersHTML(peersR.html);
 
     res.json({
       symbol,
-      warehouse_id: warehouseId,
-      screener_url: stockUrl,
+      warehouse_id: found.warehouseId,
+      screener_url: found.url,
       ratios,
       peers,
       fetched_at  : new Date().toISOString()
@@ -311,4 +282,6 @@ function parsePeersHTML(html) {
 
 app.listen(PORT, () => {
   console.log('Screener proxy running on port ' + PORT);
+  // Warm the session at boot (non-fatal — heals on first request anyway)
+  session.ensure().catch(e => console.log('⚠️ startup login: ' + e.message));
 });
