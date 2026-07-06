@@ -91,9 +91,28 @@ async function findWarehouse(symbol) {
     if (r.status !== 200) continue;
 
     const match = r.html.match(/data-warehouse-id="(\d+)"/);
-    if (match) return { warehouseId: match[1], url };
+    if (match) return { warehouseId: match[1], url, html: r.html };
   }
   return {};
+}
+
+// ── Shared: key ratios (Market Cap, CMP, P/E, ROE...) from #top-ratios ──
+// The LOGGED-IN company page renders the numbers empty (filled client-side),
+// so if the session page yields nothing we refetch the page anonymously,
+// where screener still server-renders the values.
+async function getTopRatios(pageUrl, sessionHtml) {
+  let ratios = parseTopRatios(sessionHtml || '');
+  if (Object.keys(ratios).length > 0) return ratios;
+
+  try {
+    const resp = await fetch(pageUrl, { headers: { 'User-Agent': UA } });
+    if (resp.status === 200) {
+      ratios = parseTopRatios(await resp.text());
+    }
+  } catch (e) {
+    console.log('⚠️ anonymous top-ratios fetch failed: ' + e.message);
+  }
+  return ratios;
 }
 
 // ── Get warehouse ID from stock symbol ──
@@ -178,8 +197,8 @@ app.get('/stock', checkKey, async (req, res) => {
       });
     }
 
-    // Step 2: Fetch ratios and peers in parallel
-    const [ratiosR, peersR] = await Promise.all([
+    // Step 2: Fetch custom ratios, peers, and key ratios in parallel
+    const [ratiosR, peersR, topRatios] = await Promise.all([
       fetchWithSession(
         `${SCREENER_BASE}/api/company/${found.warehouseId}/quick_ratios/`,
         { 'X-Requested-With': 'XMLHttpRequest', 'Referer': found.url }
@@ -187,7 +206,8 @@ app.get('/stock', checkKey, async (req, res) => {
       fetchWithSession(
         `${SCREENER_BASE}/api/company/${found.warehouseId}/peers/`,
         { 'X-Requested-With': 'XMLHttpRequest', 'Referer': found.url }
-      )
+      ),
+      getTopRatios(found.url, found.html)
     ]);
 
     const ratios = parseQuickRatios(ratiosR.html);
@@ -198,6 +218,7 @@ app.get('/stock', checkKey, async (req, res) => {
       warehouse_id: found.warehouseId,
       screener_url: found.url,
       ratios,
+      top_ratios  : topRatios,
       peers,
       fetched_at  : new Date().toISOString()
     });
@@ -208,6 +229,43 @@ app.get('/stock', checkKey, async (req, res) => {
 });
 
 // ── PARSERS ──
+
+// Key ratios from the company page's <ul id="top-ratios"> block:
+// Market Cap, Current Price, High / Low, Stock P/E, Book Value,
+// Dividend Yield, ROCE, ROE, Face Value.
+// Returns { name: { value, unit, display } } — display is render-ready
+// (e.g. "₹ 57,078 Cr.", "₹ 35,310 / 25,150", "1.95 %").
+function parseTopRatios(html) {
+  const block = (html.match(/<ul id="top-ratios"[\s\S]*?<\/ul>/i) || [])[0] || '';
+  const out   = {};
+
+  [...block.matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi)].forEach(m => {
+    const nameMatch = m[1].match(
+      /<span[^>]*class="[^"]*name[^"]*"[^>]*>([\s\S]*?)<\/span>/i
+    );
+    if (!nameMatch) return;
+    const name = nameMatch[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+
+    const numbers = [...m[1].matchAll(
+      /<span[^>]*class="[^"]*number[^"]*"[^>]*>([\s\S]*?)<\/span>/gi
+    )].map(n => n[1].replace(/<[^>]+>/g, '').trim()).filter(Boolean);
+    if (!name || numbers.length === 0) return;
+
+    const flat = m[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+    const unit = flat.includes('₹') && flat.includes('Cr') ? '₹Cr'
+      : flat.includes('₹') ? '₹'
+      : flat.includes('%') ? '%'
+      : '';
+
+    const value   = numbers.join(' / ');
+    const display = (unit.startsWith('₹') ? '₹ ' : '') + value
+      + (unit === '₹Cr' ? ' Cr.' : unit === '%' ? ' %' : '');
+
+    out[name] = { value, unit, display };
+  });
+
+  return out;
+}
 
 function parseQuickRatios(html) {
   const ratios  = {};
