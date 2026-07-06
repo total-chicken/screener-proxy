@@ -228,7 +228,155 @@ app.get('/stock', checkKey, async (req, res) => {
   }
 });
 
+// ── Full company data — everything the app's screener modal needs ──
+// GET /full?symbol=INFY
+// Parses the financial tables straight from the company page (which we
+// already download for the warehouse id), replacing the old
+// IMPORTHTML-via-Google-Sheets path on the Apps Script side.
+app.get('/full', checkKey, async (req, res) => {
+  const symbol = req.query.symbol;
+  if (!symbol) return res.status(400).json({ error: 'symbol required' });
+
+  try {
+    const found = await findWarehouse(symbol);
+    if (found.authFailed) return res.status(401).json(AUTH_ERROR);
+    if (!found.warehouseId) {
+      return res.status(404).json({
+        error: 'Stock not found on screener.in: ' + symbol
+      });
+    }
+
+    const html = found.html || '';
+
+    const [ratiosR, peersR, topRatios] = await Promise.all([
+      fetchWithSession(
+        `${SCREENER_BASE}/api/company/${found.warehouseId}/quick_ratios/`,
+        { 'X-Requested-With': 'XMLHttpRequest', 'Referer': found.url }
+      ),
+      fetchWithSession(
+        `${SCREENER_BASE}/api/company/${found.warehouseId}/peers/`,
+        { 'X-Requested-With': 'XMLHttpRequest', 'Referer': found.url }
+      ),
+      getTopRatios(found.url, html)
+    ]);
+
+    // key_ratios as plain display strings — the shape the app's modal expects
+    const keyRatios = {};
+    Object.keys(topRatios).forEach(k => { keyRatios[k] = topRatios[k].display; });
+
+    res.json({
+      symbol,
+      warehouse_id : found.warehouseId,
+      screener_url : found.url,
+      key_ratios   : keyRatios,
+      top_ratios   : topRatios,
+      ratios       : parseQuickRatios(ratiosR.html),
+      quarterly    : parseSectionTable(html, 'quarters'),
+      annual_pl    : parseSectionTable(html, 'profit-loss'),
+      balance_sheet: parseSectionTable(html, 'balance-sheet'),
+      cash_flow    : parseSectionTable(html, 'cash-flow'),
+      shareholding : parseSectionTable(html, 'shareholding', true),
+      ...parseRangeTables(html),
+      peers        : parsePeersHTML(peersR.html),
+      fetched_at   : new Date().toISOString()
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── PARSERS ──
+
+// First data-table inside <section id="...">, as rows the app's modal
+// renders directly: [{ '': 'Sales', 'Mar 2025': 1234, ... }, ...]
+function parseSectionTable(html, sectionId, isShareholding) {
+  const sec = (html.match(new RegExp(
+    '<section[^>]*id="' + sectionId + '"[\\s\\S]*?</section>', 'i'
+  )) || [])[0] || '';
+  const table = (sec.match(
+    /<table[^>]*class="[^"]*data-table[^"]*"[\s\S]*?<\/table>/i
+  ) || [])[0];
+  if (!table) return [];
+
+  const headHtml = (table.match(/<thead[\s\S]*?<\/thead>/i) || [''])[0];
+  const headers  = [...headHtml.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi)]
+    .map(h => h[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim());
+  if (headers.length < 2) return [];
+
+  const rows     = [];
+  const bodyHtml = (table.match(/<tbody[\s\S]*?<\/tbody>/i) || [''])[0];
+
+  [...bodyHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)].forEach(tr => {
+    const cells = [...tr[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
+      .map(td => td[1].replace(/<[^>]+>/g, ' ')
+                      .replace(/&nbsp;/gi, ' ')
+                      .replace(/&amp;/gi, '&')
+                      .replace(/\s+/g, ' ').trim());
+    if (cells.length < 2) return;
+
+    // Expandable label rows render as "Sales +" — strip the toggle marker
+    const label = cells[0].replace(/\s*[+\-]\s*$/, '').trim();
+    if (!label) return;
+
+    const obj = { '': label };
+    for (let i = 1; i < headers.length; i++) {
+      obj[headers[i] || ('Col' + i)] =
+        normalizeCell(cells[i] !== undefined ? cells[i] : '', isShareholding);
+    }
+    rows.push(obj);
+  });
+
+  return rows;
+}
+
+// "1,234" → 1234; shareholding "74.30%" → 74.3; "21%" and text stay strings
+function normalizeCell(text, isShareholding) {
+  const t = String(text || '').trim();
+  if (!t) return '';
+  if (isShareholding && /^-?[\d,]+(\.\d+)?%$/.test(t)) {
+    return Math.round(parseFloat(t.replace(/,/g, '')) * 100) / 100;
+  }
+  const plain = t.replace(/,/g, '');
+  if (/^-?\d+(\.\d+)?$/.test(plain)) {
+    return Math.round(parseFloat(plain) * 100) / 100;
+  }
+  return t;
+}
+
+// The four small "ranges" tables on the company page:
+// Compounded Sales/Profit Growth, Stock Price CAGR, Return on Equity
+// → { sales_growth: {'10 Years': '12%', ...}, profit_growth, price_cagr, roe_history }
+function parseRangeTables(html) {
+  const out = { sales_growth: {}, profit_growth: {}, price_cagr: {}, roe_history: {} };
+  const map = {
+    'compounded sales growth' : 'sales_growth',
+    'compounded profit growth': 'profit_growth',
+    'stock price cagr'        : 'price_cagr',
+    'return on equity'        : 'roe_history'
+  };
+
+  [...html.matchAll(
+    /<table[^>]*class="[^"]*ranges-table[^"]*"[^>]*>([\s\S]*?)<\/table>/gi
+  )].forEach(t => {
+    const titleM = t[1].match(/<th[^>]*>([\s\S]*?)<\/th>/i);
+    const title  = titleM
+      ? titleM[1].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim().toLowerCase()
+      : '';
+    const key = map[title];
+    if (!key) return;
+
+    [...t[1].matchAll(
+      /<td[^>]*>([\s\S]*?)<\/td>\s*<td[^>]*>([\s\S]*?)<\/td>/gi
+    )].forEach(r => {
+      const k = r[1].replace(/<[^>]+>/g, '').replace(/:/g, '').replace(/\s+/g, ' ').trim();
+      const v = r[2].replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
+      if (k && v && v !== '%') out[key][k] = v; // bare "%" = no value on the page
+    });
+  });
+
+  return out;
+}
 
 // Key ratios from the company page's <ul id="top-ratios"> block:
 // Market Cap, Current Price, High / Low, Stock P/E, Book Value,
