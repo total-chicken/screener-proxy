@@ -312,6 +312,16 @@ app.get('/screen', checkKey, async (req, res) => {
     const parsed     = parseScreenTable(r.html);
     const totalPages = parseScreenTotalPages(r.html);
 
+    if (req.query.debug) {
+      const tableMatches = [...r.html.matchAll(/<table[^>]*class="([^"]*)"/gi)]
+        .map(m => m[1]);
+      return res.json({
+        html_length  : r.html.length,
+        table_classes: tableMatches,
+        html_snippet : r.html.substring(0, 4000)
+      });
+    }
+
     res.json({
       page,
       total_pages: totalPages,
