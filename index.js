@@ -286,6 +286,45 @@ app.get('/full', checkKey, async (req, res) => {
   }
 });
 
+// ── Screen (saved query) results — logged-in view, so custom columns
+// configured on the account show up instead of the public default set.
+// GET /screen?path=screens/3781811/opm/&page=1
+app.get('/screen', checkKey, async (req, res) => {
+  const screenPath = String(req.query.path || '').trim();
+  const page       = parseInt(req.query.page, 10) || 1;
+
+  if (!/^screens\/\d+\/[\w-]+\/?$/.test(screenPath)) {
+    return res.status(400).json({
+      error: 'path required, e.g. screens/3781811/opm/'
+    });
+  }
+
+  try {
+    const cleanPath = screenPath.replace(/\/?$/, '/');
+    const url = `${SCREENER_BASE}/${cleanPath}?page=${page}`;
+
+    const r = await fetchWithSession(url);
+    if (r.authFailed) return res.status(401).json(AUTH_ERROR);
+    if (r.status !== 200) {
+      return res.status(502).json({ error: 'screener.in HTTP ' + r.status });
+    }
+
+    const parsed     = parseScreenTable(r.html);
+    const totalPages = parseScreenTotalPages(r.html);
+
+    res.json({
+      page,
+      total_pages: totalPages,
+      headers    : parsed.headers,
+      rows       : parsed.rows,
+      fetched_at : new Date().toISOString()
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── PARSERS ──
 
 // First data-table inside <section id="...">, as rows the app's modal
@@ -452,6 +491,47 @@ function parseQuickRatios(html) {
   });
 
   return ratios;
+}
+
+// Main results table on a screener.in "screen" (saved query) page.
+// Logged-in requests render whatever columns the account has configured
+// (custom columns), rather than the public default set.
+function parseScreenTable(html) {
+  const table = (html.match(
+    /<table[^>]*class="[^"]*data-table[^"]*"[\s\S]*?<\/table>/i
+  ) || [])[0];
+  if (!table) return { headers: [], rows: [] };
+
+  const headHtml = (table.match(/<thead[\s\S]*?<\/thead>/i) || [''])[0];
+  const headers  = [...headHtml.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi)]
+    .map(h => h[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  if (headers.length === 0) return { headers: [], rows: [] };
+
+  const rows     = [];
+  const bodyHtml = (table.match(/<tbody[\s\S]*?<\/tbody>/i) || [''])[0];
+
+  [...bodyHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)].forEach(tr => {
+    const cells = [...tr[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
+      .map(td => td[1].replace(/<[^>]+>/g, ' ')
+                      .replace(/&nbsp;/gi, ' ')
+                      .replace(/&amp;/gi, '&')
+                      .replace(/\s+/g, ' ').trim());
+    if (cells.length === 0) return;
+
+    const obj = {};
+    headers.forEach((h, i) => {
+      obj[h] = normalizeCell(cells[i] !== undefined ? cells[i] : '');
+    });
+    rows.push(obj);
+  });
+
+  return { headers, rows };
+}
+
+function parseScreenTotalPages(html) {
+  const m = html.match(/Page\s+\d+\s+of\s+(\d+)/i);
+  return m ? parseInt(m[1], 10) : 1;
 }
 
 function parsePeersHTML(html) {
