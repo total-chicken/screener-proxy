@@ -318,11 +318,13 @@ app.get('/screen', checkKey, async (req, res) => {
       const tableFull = (r.html.match(
         /<table[^>]*class="[^"]*data-table[^"]*"[\s\S]*?<\/table>/i
       ) || [])[0] || '(no match)';
+      const offset = parseInt(req.query.offset, 10) || 0;
       return res.json({
         html_length  : r.html.length,
         table_classes: tableMatches,
-        table_snippet: tableFull.substring(0, 4000),
-        table_length : tableFull.length
+        table_snippet: tableFull.substring(offset, offset + 4000),
+        table_length : tableFull.length,
+        tr_count     : (tableFull.match(/<tr[^>]*>/gi) || []).length
       });
     }
 
