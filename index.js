@@ -1,7 +1,8 @@
-const express  = require('express');
-const fetch    = require('node-fetch');
-const session  = require('./screenerSession');
-const app      = express();
+const express    = require('express');
+const fetch      = require('node-fetch');
+const session    = require('./screenerSession');
+const nseSession = require('./nseSession');
+const app        = express();
 // ── CORS — allow all origins ──
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -325,6 +326,83 @@ app.get('/screen', checkKey, async (req, res) => {
   }
 });
 
+// ── NSE session-aware JSON fetch ──
+// Same shape as fetchWithSession above: send the current cookie jar, and
+// on an auth failure (401/403, or a non-JSON body — Akamai's block page
+// is HTML) warm a fresh session once and retry.
+const NSE_BASE = 'https://www.nseindia.com';
+
+async function fetchNSEJson(url) {
+  const attempt = async () => {
+    const resp = await fetch(url, {
+      headers: {
+        'Cookie'          : nseSession.cookieHeader(),
+        'User-Agent'      : UA,
+        'Accept'          : 'application/json, text/plain, */*',
+        'Referer'         : NSE_BASE + '/',
+        'X-Requested-With': 'XMLHttpRequest'
+      }
+    });
+    const status = resp.status;
+    let json = null;
+    try { json = await resp.json(); } catch (e) { /* Akamai block page, not JSON */ }
+    const authFailed = status === 401 || status === 403 || !json;
+    return { status, json, authFailed };
+  };
+
+  await nseSession.ensure();
+  let r = await attempt();
+  if (r.authFailed) {
+    await nseSession.refresh();
+    r = await attempt();
+  }
+  return r;
+}
+
+// ── NSE symbol/ISIN lookup by company name ──
+// GET /nse-symbol?name=Sanofi Consumer
+// Combines NSE's globalSearch (name → symbol) and getMetaData
+// (symbol → ISIN) into one call. nseindia.com blocks this from a
+// browser with no CORS headers on the response, and blocks bare
+// server-side requests with no session cookie — this proxy solves the
+// second problem for screener.in the same way (fetchWithSession above).
+// Last-resort fallback for stocks never held by any tracked mutual fund,
+// so absent from every MF-derived symbol sheet the app already checks.
+app.get('/nse-symbol', checkKey, async (req, res) => {
+  const name = String(req.query.name || '').trim();
+  if (!name) return res.status(400).json({ error: 'name required' });
+
+  try {
+    const searchUrl = `${NSE_BASE}/api/NextApi/globalSearch/equity?symbol=${encodeURIComponent(name)}`;
+    const searchR   = await fetchNSEJson(searchUrl);
+    if (searchR.authFailed) {
+      return res.status(401).json({ error: 'NSE session failed — Akamai may be blocking this IP' });
+    }
+
+    const hit    = searchR.json && searchR.json.data && searchR.json.data[0];
+    const symbol = hit && hit.symbol ? String(hit.symbol).toUpperCase() : '';
+    if (!symbol) {
+      return res.status(404).json({ error: 'No NSE symbol found for: ' + name });
+    }
+
+    const metaUrl = `${NSE_BASE}/api/NextApi/apiClient/GetQuoteApi?functionName=getMetaData&symbol=${encodeURIComponent(symbol)}`;
+    const metaR   = await fetchNSEJson(metaUrl);
+    const isin    = (!metaR.authFailed && metaR.json && metaR.json.isin)
+      ? String(metaR.json.isin).toUpperCase() : '';
+
+    res.json({
+      name,
+      symbol,
+      isin,
+      company_name: hit.companyName || '',
+      fetched_at  : new Date().toISOString()
+    });
+
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ── PARSERS ──
 
 // First data-table inside <section id="...">, as rows the app's modal
@@ -584,6 +662,7 @@ function parsePeersHTML(html) {
 
 app.listen(PORT, () => {
   console.log('Screener proxy running on port ' + PORT);
-  // Warm the session at boot (non-fatal — heals on first request anyway)
+  // Warm both sessions at boot (non-fatal — heals on first request anyway)
   session.ensure().catch(e => console.log('⚠️ startup login: ' + e.message));
+  nseSession.ensure().catch(e => console.log('⚠️ startup NSE warm: ' + e.message));
 });
