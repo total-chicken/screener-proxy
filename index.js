@@ -315,10 +315,14 @@ app.get('/screen', checkKey, async (req, res) => {
     if (req.query.debug) {
       const tableMatches = [...r.html.matchAll(/<table[^>]*class="([^"]*)"/gi)]
         .map(m => m[1]);
+      const tableFull = (r.html.match(
+        /<table[^>]*class="[^"]*data-table[^"]*"[\s\S]*?<\/table>/i
+      ) || [])[0] || '(no match)';
       return res.json({
         html_length  : r.html.length,
         table_classes: tableMatches,
-        html_snippet : r.html.substring(0, 4000)
+        table_snippet: tableFull.substring(0, 4000),
+        table_length : tableFull.length
       });
     }
 
