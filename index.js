@@ -515,17 +515,30 @@ function parseScreenTable(html) {
 
   const rows = [];
   trBlocks.slice(1).forEach(tr => {
-    const cells = [...tr[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
-      .map(td => td[1].replace(/<[^>]+>/g, ' ')
-                      .replace(/&nbsp;/gi, ' ')
-                      .replace(/&amp;/gi, '&')
-                      .replace(/\s+/g, ' ').trim());
-    if (cells.length === 0) return;
+    // Keep the raw (pre-strip) cell HTML around just long enough to pull
+    // the Name cell's /company/<SYMBOL>/ link before it's thrown away —
+    // that link is the only exact stock identity screener.in gives us.
+    const rawCells = [...tr[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
+      .map(td => td[1]);
+    if (rawCells.length === 0) return;
+
+    const cells = rawCells.map(raw => raw
+      .replace(/<[^>]+>/g, ' ')
+      .replace(/&nbsp;/gi, ' ')
+      .replace(/&amp;/gi, '&')
+      .replace(/\s+/g, ' ').trim());
 
     const obj = {};
     headers.forEach((h, i) => {
       obj[h] = normalizeCell(cells[i] !== undefined ? cells[i] : '');
     });
+
+    const linkCellRaw = rawCells.find(raw => /href="[^"]*\/company\//i.test(raw));
+    if (linkCellRaw) {
+      const hrefMatch = linkCellRaw.match(/href="([^"]*\/company\/[^"]*)"/i);
+      if (hrefMatch) obj._link = hrefMatch[1];
+    }
+
     rows.push(obj);
   });
 
