@@ -312,22 +312,6 @@ app.get('/screen', checkKey, async (req, res) => {
     const parsed     = parseScreenTable(r.html);
     const totalPages = parseScreenTotalPages(r.html);
 
-    if (req.query.debug) {
-      const tableMatches = [...r.html.matchAll(/<table[^>]*class="([^"]*)"/gi)]
-        .map(m => m[1]);
-      const tableFull = (r.html.match(
-        /<table[^>]*class="[^"]*data-table[^"]*"[\s\S]*?<\/table>/i
-      ) || [])[0] || '(no match)';
-      const offset = parseInt(req.query.offset, 10) || 0;
-      return res.json({
-        html_length  : r.html.length,
-        table_classes: tableMatches,
-        table_snippet: tableFull.substring(offset, offset + 4000),
-        table_length : tableFull.length,
-        tr_count     : (tableFull.match(/<tr[^>]*>/gi) || []).length
-      });
-    }
-
     res.json({
       page,
       total_pages: totalPages,
@@ -512,22 +496,25 @@ function parseQuickRatios(html) {
 // Main results table on a screener.in "screen" (saved query) page.
 // Logged-in requests render whatever columns the account has configured
 // (custom columns), rather than the public default set.
+// NOTE: this table has no <thead> — the header row is just the first
+// <tr> (with <th> cells) sitting directly inside <tbody>, data rows are
+// <tr data-row-company-id="..."> with plain <td> cells.
 function parseScreenTable(html) {
   const table = (html.match(
     /<table[^>]*class="[^"]*data-table[^"]*"[\s\S]*?<\/table>/i
   ) || [])[0];
   if (!table) return { headers: [], rows: [] };
 
-  const headHtml = (table.match(/<thead[\s\S]*?<\/thead>/i) || [''])[0];
-  const headers  = [...headHtml.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi)]
+  const trBlocks = [...table.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)];
+  if (trBlocks.length === 0) return { headers: [], rows: [] };
+
+  const headers = [...trBlocks[0][1].matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi)]
     .map(h => h[1].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim())
     .filter(Boolean);
   if (headers.length === 0) return { headers: [], rows: [] };
 
-  const rows     = [];
-  const bodyHtml = (table.match(/<tbody[\s\S]*?<\/tbody>/i) || [''])[0];
-
-  [...bodyHtml.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)].forEach(tr => {
+  const rows = [];
+  trBlocks.slice(1).forEach(tr => {
     const cells = [...tr[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)]
       .map(td => td[1].replace(/<[^>]+>/g, ' ')
                       .replace(/&nbsp;/gi, ' ')
