@@ -109,7 +109,11 @@ app.post('/mdm', checkKey, express.json({ limit: '5mb' }), async (req, res) => {
   try {
     const resp = await fetch(MDM_BASE + path, opts);
     const text = await resp.text();
-    res.json({ status: resp.status, body: text });
+    res.json({
+      status     : resp.status,
+      contentType: resp.headers.get('content-type') || '',
+      body       : text
+    });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
