@@ -74,7 +74,45 @@ function checkKey(req, res, next) {
 
 // ── Health check — no auth needed ──
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'screener-proxy' });
+  res.json({ status: 'ok', service: 'screener-proxy', mdm: true });
+});
+
+// ── MDM API forward ──
+// POST /mdm  { path, method, token, payload, form }
+// The MDM gateway (mdm.genusdvvnl.in) 403-blocks Google server IPs, so the
+// MMS Apps Script backend relays its API and Keycloak calls through here.
+// path is always appended to MDM_BASE — this cannot be used as an open proxy.
+// `payload` (object) is sent as JSON; `form` (string or object) is sent as
+// application/x-www-form-urlencoded (used for the Keycloak token grant).
+const MDM_BASE = 'https://mdm.genusdvvnl.in';
+
+app.post('/mdm', checkKey, express.json({ limit: '5mb' }), async (req, res) => {
+  const { path, method, token, payload, form } = req.body || {};
+
+  if (!path || typeof path !== 'string' || !path.startsWith('/')) {
+    return res.status(400).json({ error: 'path required (must start with /)' });
+  }
+
+  const m = String(method || 'GET').toUpperCase();
+  const headers = { 'User-Agent': UA, 'Accept': 'application/json' };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+
+  const opts = { method: m, headers };
+  if (form) {
+    headers['Content-Type'] = 'application/x-www-form-urlencoded';
+    opts.body = typeof form === 'string' ? form : new URLSearchParams(form).toString();
+  } else if (payload !== undefined && payload !== null && m !== 'GET' && m !== 'HEAD') {
+    headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(payload);
+  }
+
+  try {
+    const resp = await fetch(MDM_BASE + path, opts);
+    const text = await resp.text();
+    res.json({ status: resp.status, body: text });
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 // ── Shared: resolve a symbol to its warehouse ID ──
